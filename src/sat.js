@@ -31,11 +31,16 @@ async function descargarCfdis({
   let token;
   try {
     token = await service.authenticate(credential);
-    console.log(`[SAT] Token obtenido:`, JSON.stringify(token).substring(0, 100));
+    // Log completo para diagnóstico
+    console.log(`[SAT] Token tipo:`, typeof token);
+    console.log(`[SAT] Token keys:`, token ? Object.keys(token) : 'null');
+    console.log(`[SAT] Token raw:`, JSON.stringify(token).substring(0, 300));
+    console.log(`[SAT] getToken:`, typeof token.getToken === 'function' ? token.getToken() : 'no existe');
+    console.log(`[SAT] getValue:`, typeof token.getValue === 'function' ? token.getValue() : 'no existe');
+    console.log(`[SAT] getCreatedAt:`, typeof token.getCreatedAt === 'function' ? token.getCreatedAt() : 'no existe');
   } catch (err) {
     throw new Error(`Error de autenticación: ${err.message}`);
   }
-
   // Verificar token de distintas formas según versión de la librería
   const tokenValue = typeof token.getToken === 'function' ? token.getToken() :
                      typeof token.getValue === 'function' ? token.getValue() :
