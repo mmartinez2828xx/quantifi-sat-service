@@ -1,0 +1,17 @@
+{
+  "name": "quantifi-sat-service",
+  "version": "1.0.0",
+  "description": "Servicio para descargar CFDIs del SAT via FIEL",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@nodecfdi/credentials": "^2.0.0",
+    "@nodecfdi/sat-ws-descarga-masiva": "^3.0.0",
+    "@supabase/supabase-js": "^2.84.0",
+    "adm-zip": "^0.5.10",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0"
+  }
+}
