@@ -1,129 +1,182 @@
-const {
-  ServiceFactory,
-  QueryParameters,
-  DateTimePeriod,
-  DownloadType,
-  RequestType,
-} = require("@nodecfdi/sat-ws-descarga-masiva");
-const { Fiel } = require("@nodecfdi/credentials");
-const AdmZip = require("adm-zip");
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const { createClient } = require("@supabase/supabase-js");
+const { descargarCfdis } = require("./sat");
 
-async function descargarCfdis({
-  cerBase64, keyBase64, password, rfc, fechaInicio, fechaFin, tipoSolicitud,
-}) {
-  console.log(`[SAT] Iniciando ${tipoSolicitud} para RFC ${rfc}`);
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
-  const cerBuffer = Buffer.from(cerBase64, "base64");
-  const keyBuffer = Buffer.from(keyBase64, "base64");
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
 
-  let fiel;
+const API_KEY = process.env.API_KEY;
+
+function authMiddleware(req, res, next) {
+  if (req.method === "OPTIONS") return next();
+  const key = req.headers["x-api-key"];
+  if (!key || key !== API_KEY) {
+    return res.status(401).json({ error: "API key inválida" });
+  }
+  next();
+}
+app.use(authMiddleware);
+
+app.get("/health", (_req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+
+app.post("/descargar-una", async (req, res) => {
+  const { empresaId, efirma } = req.body;
+  if (!empresaId) {
+    return res.status(400).json({ error: "empresaId es requerido" });
+  }
+
   try {
-    fiel = Fiel.create(cerBuffer, keyBuffer, password);
-    console.log(`[SAT] FIEL creada correctamente`);
-  } catch (err) {
-    throw new Error(`Error al leer la e.firma: ${String(err)}`);
-  }
+    let cerBase64, keyBase64, password, rfc;
 
-  if (!fiel.isValid()) {
-    throw new Error(`La e.firma no es válida o está vencida`);
-  }
+    if (efirma) {
+      // Los datos vienen directo del frontend
+      cerBase64 = efirma.cer_base64;
+      keyBase64  = efirma.key_base64;
+      password   = efirma.password;
+      rfc        = efirma.rfc;
+    } else {
+      // Buscar en Supabase
+      const { data, error } = await supabase
+        .from("empresa_efirmas")
+        .select("*")
+        .eq("empresa_id", empresaId)
+        .eq("activa", true)
+        .single();
 
-  const service = ServiceFactory.create(ServiceFactory.newHttpsWebClient());
-
-  console.log(`[SAT] Autenticando con FIEL...`);
-  let token;
-  try {
-    token = await service.authenticate(fiel);
-    console.log(`[SAT] Token recibido, tipo: ${typeof token}`);
-    console.log(`[SAT] Token keys: ${Object.keys(token || {}).join(', ')}`);
-  } catch (err) {
-    throw new Error(`Error de autenticación: ${String(err)}`);
-  }
-
-  if (!token || !token.isValid || !token.isValid()) {
-    throw new Error(`Token SAT inválido después de autenticar`);
-  }
-  console.log(`[SAT] Autenticación exitosa`);
-
-  const period = DateTimePeriod.create(fechaInicio, fechaFin);
-  const downloadType = tipoSolicitud === "emitidos" ? DownloadType.issued() : DownloadType.received();
-  const requestType  = tipoSolicitud === "emitidos" ? RequestType.issued()  : RequestType.received();
-  const parameters   = QueryParameters.create(period, downloadType, requestType);
-
-  console.log(`[SAT] Enviando solicitud...`);
-  let queryResult;
-  try {
-    queryResult = await service.query(fiel, parameters);
-  } catch (err) {
-    throw new Error(`Error al solicitar: ${String(err)}`);
-  }
-
-  if (!queryResult.getStatus().isAccepted()) {
-    throw new Error(`Solicitud rechazada: ${queryResult.getStatus().getMessage()}`);
-  }
-
-  const idSolicitud = queryResult.getRequestId();
-  console.log(`[SAT] Solicitud aceptada: ${idSolicitud}`);
-
-  let paquetes = [];
-  for (let i = 0; i < 40; i++) {
-    await sleep(15000);
-    console.log(`[SAT] Verificando intento ${i + 1}/40...`);
-
-    let verifyResult;
-    try {
-      verifyResult = await service.verify(fiel, idSolicitud);
-    } catch (err) {
-      console.warn(`[SAT] Error verificando: ${String(err)}`);
-      continue;
+      if (error || !data) {
+        return res.status(404).json({ error: "No se encontró e.firma activa" });
+      }
+      cerBase64 = data.cer_base64;
+      keyBase64  = data.key_base64;
+      password   = data.password;
+      rfc        = data.rfc;
     }
 
-    if (!verifyResult.getStatus().isAccepted()) continue;
+    const ayer = new Date();
+    ayer.setDate(ayer.getDate() - 1);
+    const fechaInicio = new Date(ayer); fechaInicio.setHours(0, 0, 0, 0);
+    const fechaFin    = new Date(ayer); fechaFin.setHours(23, 59, 59, 999);
 
-    const statusCode = verifyResult.getStatusRequest().value;
-    console.log(`[SAT] Estado: ${statusCode}`);
+    const { data: solicitud } = await supabase
+      .from("sat_solicitudes")
+      .insert({
+        empresa_id:   empresaId,
+        rfc,
+        tipo:         "ambos",
+        fecha_inicio: fechaInicio.toISOString().split("T")[0],
+        fecha_fin:    fechaFin.toISOString().split("T")[0],
+        estado:       "procesando",
+      })
+      .select()
+      .single();
 
-    if (statusCode >= 4) throw new Error(`SAT error código ${statusCode}`);
-    if (statusCode === 3) {
-      paquetes = verifyResult.getPackageIds();
-      console.log(`[SAT] Listo. ${paquetes.length} paquete(s)`);
-      break;
-    }
+    res.json({ message: "Descarga iniciada", solicitudId: solicitud?.id });
+
+    // Proceso en background
+    procesarDescarga({ cerBase64, keyBase64, password, rfc }, solicitud?.id, empresaId, fechaInicio, fechaFin);
+
+  } catch (err) {
+    console.error("Error general:", err);
+    res.status(500).json({ error: err.message });
   }
+});
 
-  if (paquetes.length === 0) {
-    console.log(`[SAT] Sin CFDIs en el periodo`);
-    return [];
-  }
+async function procesarDescarga(efirmaData, solicitudId, empresaId, fechaInicio, fechaFin) {
+  let cfdisNuevos = 0;
+  try {
+    console.log(`[${solicitudId}] Iniciando descarga para RFC ${efirmaData.rfc}`);
 
-  const xmls = [];
-  for (const packageId of paquetes) {
-    console.log(`[SAT] Descargando paquete ${packageId}...`);
-    let downloadResult;
-    try {
-      downloadResult = await service.download(fiel, packageId);
-    } catch (err) {
-      console.warn(`Error descargando: ${String(err)}`);
-      continue;
-    }
+    for (const tipo of ["recibidos", "emitidos"]) {
+      try {
+        const xmls = await descargarCfdis({ ...efirmaData, fechaInicio, fechaFin, tipoSolicitud: tipo });
+        console.log(`[${solicitudId}] ${tipo}: ${xmls.length} XMLs`);
 
-    if (!downloadResult.getStatus().isAccepted()) continue;
-
-    const zipBuffer = Buffer.from(downloadResult.getPackageContent(), "base64");
-    const zip = new AdmZip(zipBuffer);
-    for (const entry of zip.getEntries()) {
-      if (entry.entryName.endsWith(".xml")) {
-        xmls.push(entry.getData().toString("utf8"));
+        for (const xml of xmls) {
+          try {
+            const datos = parsearCfdiXml(xml, empresaId, efirmaData.rfc);
+            const { error } = await supabase
+              .from("cfdis")
+              .upsert(datos, { onConflict: "uuid_fiscal,empresa_id" });
+            if (!error) cfdisNuevos++;
+          } catch (e) {
+            console.warn("Error parseando XML:", e.message);
+          }
+        }
+      } catch (e) {
+        console.error(`Error en ${tipo}:`, e.message);
       }
     }
+
+    await supabase.from("sat_solicitudes")
+      .update({ estado: "completado", cfdis_nuevos: cfdisNuevos, completado_at: new Date() })
+      .eq("id", solicitudId);
+
+    console.log(`[${solicitudId}] Completado: ${cfdisNuevos} CFDIs`);
+
+  } catch (err) {
+    console.error(`[${solicitudId}] Error:`, err);
+    await supabase.from("sat_solicitudes")
+      .update({ estado: "error", completado_at: new Date() })
+      .eq("id", solicitudId);
   }
-
-  console.log(`[SAT] Total ${tipoSolicitud}: ${xmls.length} XMLs`);
-  return xmls;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function parsearCfdiXml(xmlString, empresaId, rfcEmpresa) {
+  const attr = (tag, name) => {
+    const re = new RegExp(`<[^>]*${tag}[^>]*${name}="([^"]*)"`, "i");
+    const m = xmlString.match(re);
+    return m ? m[1] : null;
+  };
+
+  const uuid = attr("tfd:TimbreFiscalDigital", "UUID") || attr("TimbreFiscalDigital", "UUID");
+  if (!uuid) throw new Error("XML sin UUID");
+
+  const rfcEmisor   = attr("cfdi:Emisor",   "Rfc") || attr("Emisor",   "Rfc");
+  const rfcReceptor = attr("cfdi:Receptor", "Rfc") || attr("Receptor", "Rfc");
+  const tipoRaw = attr("cfdi:Comprobante", "TipoDeComprobante") || "I";
+  const tipoMap = { I: "ingreso", E: "egreso", T: "traslado", P: "pago", N: "nomina" };
+  const total      = parseFloat(attr("cfdi:Comprobante", "Total")    || "0");
+  const subtotal   = parseFloat(attr("cfdi:Comprobante", "SubTotal") || "0");
+  const moneda     = attr("cfdi:Comprobante", "Moneda")    || "MXN";
+  const tipoCambio = parseFloat(attr("cfdi:Comprobante", "TipoCambio") || "1");
+
+  return {
+    uuid_fiscal:      uuid.toUpperCase(),
+    empresa_id:       empresaId,
+    tipo:             tipoMap[tipoRaw] || tipoRaw.toLowerCase(),
+    direccion:        rfcEmisor === rfcEmpresa ? "emitido" : "recibido",
+    rfc_emisor:       rfcEmisor,
+    nombre_emisor:    attr("cfdi:Emisor",   "Nombre"),
+    rfc_receptor:     rfcReceptor,
+    nombre_receptor:  attr("cfdi:Receptor", "Nombre"),
+    uso_cfdi:         attr("cfdi:Receptor", "UsoCFDI"),
+    total,
+    subtotal,
+    moneda,
+    tipo_cambio:      tipoCambio,
+    total_mxn:        moneda === "MXN" ? total : total * tipoCambio,
+    metodo_pago:      attr("cfdi:Comprobante", "MetodoPago"),
+    forma_pago:       attr("cfdi:Comprobante", "FormaPago"),
+    serie:            attr("cfdi:Comprobante", "Serie"),
+    folio:            attr("cfdi:Comprobante", "Folio"),
+    fecha_emision:    attr("cfdi:Comprobante", "Fecha"),
+    fecha_timbrado:   attr("tfd:TimbreFiscalDigital", "FechaTimbrado"),
+    estado_sat:       "vigente",
+    xml_raw:          xmlString,
+    fecha_importacion: new Date().toISOString(),
+  };
 }
 
-module.exports = { descargarCfdis };
+app.listen(process.env.PORT || 3000, () => {
+  console.log(`quantifi-sat-service corriendo en puerto ${process.env.PORT || 3000}`);
+});
