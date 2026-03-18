@@ -1,3 +1,5 @@
+// docs/sat-service/src/index.js
+
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -15,6 +17,7 @@ const supabase = createClient(
 
 const API_KEY = process.env.API_KEY;
 
+// ── Middleware de autenticación ──
 function authMiddleware(req, res, next) {
   if (req.method === "OPTIONS") return next();
   const key = req.headers["x-api-key"];
@@ -23,30 +26,40 @@ function authMiddleware(req, res, next) {
   }
   next();
 }
+
 app.use(authMiddleware);
 
+// ── Health check ──
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
+// ── Endpoint principal: descargar CFDIs de ayer ──
 app.post("/descargar-una", async (req, res) => {
-  const { empresaId } = req.body;
+  const { empresaId, efirma: efirmaBody } = req.body;
+
   if (!empresaId) {
     return res.status(400).json({ error: "empresaId es requerido" });
   }
 
   try {
-    const { data: efirma, error: efError } = await supabase
-      .from("empresa_efirmas")
-      .select("*")
-      .eq("empresa_id", empresaId)
-      .eq("activa", true)
-      .single();
+    // Use efirma from request body (sent by frontend) or fallback to DB lookup
+    let efirma = efirmaBody;
+    if (!efirma || !efirma.cer_base64) {
+      const { data, error: efError } = await supabase
+        .from("empresa_efirmas")
+        .select("*")
+        .eq("empresa_id", empresaId)
+        .eq("activa", true)
+        .single();
 
-    if (efError || !efirma) {
-      return res.status(404).json({ error: "No se encontró e.firma activa" });
+      if (efError || !data) {
+        return res.status(404).json({ error: "No se encontró e.firma activa para esta empresa" });
+      }
+      efirma = data;
     }
 
+    // 2. Calcular rango de fechas (ayer)
     const ayer = new Date();
     ayer.setDate(ayer.getDate() - 1);
     const fechaInicio = new Date(ayer);
@@ -54,6 +67,7 @@ app.post("/descargar-una", async (req, res) => {
     const fechaFin = new Date(ayer);
     fechaFin.setHours(23, 59, 59, 999);
 
+    // 3. Crear registro de solicitud
     const { data: solicitud, error: solError } = await supabase
       .from("sat_solicitudes")
       .insert({
@@ -68,23 +82,30 @@ app.post("/descargar-una", async (req, res) => {
       .single();
 
     if (solError) {
+      console.error("Error creando solicitud:", solError);
       return res.status(500).json({ error: "Error al registrar solicitud" });
     }
 
-    res.json({ message: "Descarga iniciada", solicitudId: solicitud.id });
+    // 4. Responder inmediatamente y procesar en background
+    res.json({
+      message: "Descarga iniciada",
+      solicitudId: solicitud.id,
+    });
 
+    // 5. Proceso asíncrono de descarga
     procesarDescarga(efirma, solicitud.id, empresaId, fechaInicio, fechaFin);
-
   } catch (err) {
     console.error("Error general:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
+// ── Proceso en background ──
 async function procesarDescarga(efirma, solicitudId, empresaId, fechaInicio, fechaFin) {
   try {
-    console.log(`[${solicitudId}] Iniciando para RFC ${efirma.rfc}...`);
+    console.log(`[${solicitudId}] Iniciando descarga SAT para RFC ${efirma.rfc}...`);
 
+    // Descargar CFDIs (emitidos + recibidos)
     const xmlsRecibidos = await descargarCfdis({
       cerBase64: efirma.cer_base64,
       keyBase64: efirma.key_base64,
@@ -106,21 +127,24 @@ async function procesarDescarga(efirma, solicitudId, empresaId, fechaInicio, fec
     });
 
     const todosXmls = [...xmlsRecibidos, ...xmlsEmitidos];
-    console.log(`[${solicitudId}] ${todosXmls.length} XMLs obtenidos`);
+    console.log(`[${solicitudId}] ${todosXmls.length} XMLs obtenidos del SAT`);
 
+    // Parsear e insertar cada CFDI
     let cfdisNuevos = 0;
     for (const xml of todosXmls) {
       try {
         const datos = parsearCfdiXml(xml, empresaId, efirma.rfc);
-        const { error } = await supabase
+        const { error: insertErr } = await supabase
           .from("cfdis")
           .upsert(datos, { onConflict: "uuid_fiscal,empresa_id" });
-        if (!error) cfdisNuevos++;
+
+        if (!insertErr) cfdisNuevos++;
       } catch (parseErr) {
-        console.warn(`Error parseando XML:`, parseErr.message);
+        console.warn(`[${solicitudId}] Error parseando un XML:`, parseErr.message);
       }
     }
 
+    // Actualizar solicitud como completada
     await supabase
       .from("sat_solicitudes")
       .update({
@@ -130,18 +154,23 @@ async function procesarDescarga(efirma, solicitudId, empresaId, fechaInicio, fec
       })
       .eq("id", solicitudId);
 
-    console.log(`[${solicitudId}] Completado: ${cfdisNuevos} CFDIs nuevos`);
-
+    console.log(`[${solicitudId}] ✅ Completado: ${cfdisNuevos} CFDIs nuevos`);
   } catch (err) {
-    console.error(`[${solicitudId}] Error:`, err);
+    console.error(`[${solicitudId}] ❌ Error en descarga:`, err);
+
     await supabase
       .from("sat_solicitudes")
-      .update({ estado: "error", completado_at: new Date().toISOString() })
+      .update({
+        estado: "error",
+        completado_at: new Date().toISOString(),
+      })
       .eq("id", solicitudId);
   }
 }
 
+// ── Parser de CFDI XML → objeto para Supabase ──
 function parsearCfdiXml(xmlString, empresaId, rfcEmpresa) {
+  // Extraer atributos con regex (ligero, sin dependencia XML pesada)
   const attr = (tag, name) => {
     const re = new RegExp(`<[^>]*${tag}[^>]*${name}="([^"]*)"`, "i");
     const m = xmlString.match(re);
@@ -149,48 +178,51 @@ function parsearCfdiXml(xmlString, empresaId, rfcEmpresa) {
   };
 
   const uuid = attr("tfd:TimbreFiscalDigital", "UUID") || attr("TimbreFiscalDigital", "UUID");
-  if (!uuid) throw new Error("XML sin UUID");
+  if (!uuid) throw new Error("XML sin UUID de timbre fiscal");
 
-  const rfcEmisor   = attr("cfdi:Emisor",    "Rfc") || attr("Emisor",    "Rfc");
-  const rfcReceptor = attr("cfdi:Receptor",  "Rfc") || attr("Receptor",  "Rfc");
-  const direccion   = rfcEmisor === rfcEmpresa ? "emitido" : "recibido";
+  const rfcEmisor = attr("cfdi:Emisor", "Rfc") || attr("Emisor", "Rfc");
+  const rfcReceptor = attr("cfdi:Receptor", "Rfc") || attr("Receptor", "Rfc");
+  const direccion = rfcEmisor === rfcEmpresa ? "emitido" : "recibido";
 
   const tipoRaw = attr("cfdi:Comprobante", "TipoDeComprobante") || attr("Comprobante", "TipoDeComprobante") || "I";
   const tipoMap = { I: "ingreso", E: "egreso", T: "traslado", P: "pago", N: "nomina" };
 
-  const total      = parseFloat(attr("cfdi:Comprobante", "Total")      || attr("Comprobante", "Total")      || "0");
-  const subtotal   = parseFloat(attr("cfdi:Comprobante", "SubTotal")   || attr("Comprobante", "SubTotal")   || "0");
-  const moneda     = attr("cfdi:Comprobante", "Moneda")                || attr("Comprobante", "Moneda")     || "MXN";
+  const total = parseFloat(attr("cfdi:Comprobante", "Total") || attr("Comprobante", "Total") || "0");
+  const subtotal = parseFloat(attr("cfdi:Comprobante", "SubTotal") || attr("Comprobante", "SubTotal") || "0");
+  const moneda = attr("cfdi:Comprobante", "Moneda") || attr("Comprobante", "Moneda") || "MXN";
   const tipoCambio = parseFloat(attr("cfdi:Comprobante", "TipoCambio") || attr("Comprobante", "TipoCambio") || "1");
+  const metodoPago = attr("cfdi:Comprobante", "MetodoPago") || attr("Comprobante", "MetodoPago");
+  const formaPago = attr("cfdi:Comprobante", "FormaPago") || attr("Comprobante", "FormaPago");
 
   return {
-    uuid_fiscal:     uuid.toUpperCase(),
-    empresa_id:      empresaId,
-    tipo:            tipoMap[tipoRaw] || tipoRaw.toLowerCase(),
+    uuid_fiscal: uuid.toUpperCase(),
+    empresa_id: empresaId,
+    tipo: tipoMap[tipoRaw] || tipoRaw.toLowerCase(),
     direccion,
-    rfc_emisor:      rfcEmisor,
-    nombre_emisor:   attr("cfdi:Emisor",    "Nombre") || attr("Emisor",    "Nombre"),
-    rfc_receptor:    rfcReceptor,
-    nombre_receptor: attr("cfdi:Receptor",  "Nombre") || attr("Receptor",  "Nombre"),
-    uso_cfdi:        attr("cfdi:Receptor",  "UsoCFDI") || attr("Receptor", "UsoCFDI"),
+    rfc_emisor: rfcEmisor,
+    nombre_emisor: attr("cfdi:Emisor", "Nombre") || attr("Emisor", "Nombre"),
+    rfc_receptor: rfcReceptor,
+    nombre_receptor: attr("cfdi:Receptor", "Nombre") || attr("Receptor", "Nombre"),
+    uso_cfdi: attr("cfdi:Receptor", "UsoCFDI") || attr("Receptor", "UsoCFDI"),
     total,
     subtotal,
     moneda,
-    tipo_cambio:     tipoCambio,
-    total_mxn:       moneda === "MXN" ? total : total * tipoCambio,
-    metodo_pago:     attr("cfdi:Comprobante", "MetodoPago") || attr("Comprobante", "MetodoPago"),
-    forma_pago:      attr("cfdi:Comprobante", "FormaPago")  || attr("Comprobante", "FormaPago"),
-    serie:           attr("cfdi:Comprobante", "Serie")      || attr("Comprobante", "Serie"),
-    folio:           attr("cfdi:Comprobante", "Folio")      || attr("Comprobante", "Folio"),
-    fecha_emision:   attr("cfdi:Comprobante", "Fecha")      || attr("Comprobante", "Fecha"),
-    fecha_timbrado:  attr("tfd:TimbreFiscalDigital", "FechaTimbrado") || attr("TimbreFiscalDigital", "FechaTimbrado"),
-    estado_sat:      "vigente",
-    xml_raw:         xmlString,
+    tipo_cambio: tipoCambio,
+    total_mxn: moneda === "MXN" ? total : total * tipoCambio,
+    metodo_pago: metodoPago,
+    forma_pago: formaPago,
+    serie: attr("cfdi:Comprobante", "Serie") || attr("Comprobante", "Serie"),
+    folio: attr("cfdi:Comprobante", "Folio") || attr("Comprobante", "Folio"),
+    fecha_emision: attr("cfdi:Comprobante", "Fecha") || attr("Comprobante", "Fecha"),
+    fecha_timbrado: attr("tfd:TimbreFiscalDigital", "FechaTimbrado") || attr("TimbreFiscalDigital", "FechaTimbrado"),
+    estado_sat: "vigente",
+    xml_raw: xmlString,
     fecha_importacion: new Date().toISOString(),
   };
 }
 
+// ── Iniciar servidor ──
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`quantifi-sat-service corriendo en puerto ${PORT}`);
+  console.log(`🚀 quantifi-sat-service corriendo en puerto ${PORT}`);
 });
