@@ -19,22 +19,19 @@ async function descargarCfdis({
   const cerBuffer = Buffer.from(cerBase64, "base64");
   const keyBuffer = Buffer.from(keyBase64, "base64");
 
-  // API correcta para v2.x
   const credential = Credential.create(cerBuffer, keyBuffer, password);
   const fiel = credential.fiel();
 
   if (!fiel.isValid()) {
-    throw new Error(`La e.firma no es válida o está vencida para RFC ${rfc}`);
+    throw new Error(`e.firma no válida o vencida para RFC ${rfc}`);
   }
-
-  console.log(`[SAT] FIEL válida para RFC ${rfc}`);
+  console.log(`[SAT] FIEL válida`);
 
   const requestBuilder = new FielRequestBuilder(fiel);
   const gateway = new SatHttpsGateway();
   const endpoints = ServiceEndpoints.cfdi();
   const service = new Service(requestBuilder, gateway, endpoints);
 
-  // En v2.x authenticate() no recibe argumentos
   console.log(`[SAT] Autenticando...`);
   const token = await service.authenticate();
 
@@ -65,10 +62,7 @@ async function descargarCfdis({
 
     const verifyResult = await service.verify(idSolicitud);
 
-    if (!verifyResult.getStatus().isAccepted()) {
-      console.warn(`[SAT] No aceptada: ${verifyResult.getStatus().getMessage()}`);
-      continue;
-    }
+    if (!verifyResult.getStatus().isAccepted()) continue;
 
     const statusCode = verifyResult.getStatusRequest().value;
     console.log(`[SAT] Estado: ${statusCode}`);
@@ -91,10 +85,7 @@ async function descargarCfdis({
     console.log(`[SAT] Descargando paquete ${packageId}...`);
     const downloadResult = await service.download(packageId);
 
-    if (!downloadResult.getStatus().isAccepted()) {
-      console.warn(`Paquete rechazado: ${downloadResult.getStatus().getMessage()}`);
-      continue;
-    }
+    if (!downloadResult.getStatus().isAccepted()) continue;
 
     const zipBuffer = Buffer.from(downloadResult.getPackageContent(), "base64");
     const zip = new AdmZip(zipBuffer);
