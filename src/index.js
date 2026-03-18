@@ -16,6 +16,7 @@ const supabase = createClient(
 const API_KEY = process.env.API_KEY;
 
 function authMiddleware(req, res, next) {
+  if (req.method === "OPTIONS") return next();
   const key = req.headers["x-api-key"];
   if (!key || key !== API_KEY) {
     return res.status(401).json({ error: "API key inválida" });
